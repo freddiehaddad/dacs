@@ -331,7 +331,7 @@ python3 /tmp/harness.py`, preCommand, string(authScript), string(methodScript), 
 		}
 	}
 
-	// Blobfuse method: pass mount paths and dist_cache (DACS L2) settings.
+	// Blobfuse method: pass mount paths and distributed_cache (DACS L2) settings.
 	// The Python module reads these env vars to render the blobfuse2 YAML config
 	// at runtime.
 	if r.Method == Blobfuse {
