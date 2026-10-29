@@ -99,6 +99,32 @@ creating Cache workloads.
 The controller chart does not create Cache resources. Start with the static,
 dynamic, or Minikube manifests in [`examples`](examples/README.md).
 
+### CacheServer Environment Variables
+
+Set environment variables directly under `spec.env` in the standalone Cache
+manifest, alongside fields such as `serverThreads`:
+
+```yaml
+spec:
+  env:
+    - name: STORAGE_LOG_LEVEL
+      value: "info"
+    - name: CACHESERVER_THREADPOOL_SIZE
+      valueFrom:
+        configMapKeyRef:
+          name: cache-settings
+          key: threads
+```
+
+Variable names must start with `STORAGE_` or `CACHESERVER_`. Use `spec.env` to
+add variables or override the controller's defaults by name. Values can be
+literal or reference a ConfigMap or Secret in the Cache's namespace.
+Removing an override restores the default; removing an added variable removes
+it from the cache-server pods.
+
+Changing `spec.env` rolls the cache-server pods. Before using this field, apply
+the updated Cache CRD as described in the [upgrade procedure](#upgrade).
+
 ### CacheServer Scheduling on Tainted Nodes
 
 `manager.tolerations` applies only to the controller Deployment. CacheServer

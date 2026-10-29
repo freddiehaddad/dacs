@@ -116,6 +116,23 @@ var _ = Describe("Cache Controller", func() {
 			return "", false
 		}
 
+		expectStatefulSetEnvVars := func(ctx context.Context, g Gomega, name string, expected ...corev1.EnvVar) {
+			var statefulSet appsv1.StatefulSet
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: name, Namespace: resourceNamespace,
+			}, &statefulSet)).To(Succeed(), "getting StatefulSet %s", name)
+			g.Expect(statefulSet.Spec.Template.Spec.Containers).NotTo(BeEmpty(), "StatefulSet should have a cache-server container")
+			for _, expectedEnv := range expected {
+				var matches []corev1.EnvVar
+				for _, env := range statefulSet.Spec.Template.Spec.Containers[0].Env {
+					if env.Name == expectedEnv.Name {
+						matches = append(matches, env)
+					}
+				}
+				g.Expect(matches).To(ConsistOf(expectedEnv), "checking environment variable %s", expectedEnv.Name)
+			}
+		}
+
 		// Helper to get discovery ConfigMap server count by cache name
 		getConfigMapServerCountByName := func(name string) string {
 			configMap := &corev1.ConfigMap{}
@@ -411,6 +428,114 @@ var _ = Describe("Cache Controller", func() {
 				}
 			}, timeout, pollInterval).Should(Succeed(), "waiting for zero CPU and memory resources")
 		})
+		It("should add, override, update, and remove environment variables", func(ctx SpecContext) {
+			cacheName := "test-cache-env"
+			cache := createTestCache(cacheName, resourceNamespace, 1, true)
+			cache.Spec.Env = []corev1.EnvVar{
+				{Name: "STORAGE_LOG_LEVEL", Value: "INFO"},
+				{Name: "CACHESERVER_THREADPOOL_SIZE", Value: "32"},
+			}
+			Expect(k8sClient.Create(ctx, cache)).To(Succeed(), "creating Cache with environment overrides")
+			DeferCleanup(func(ctx SpecContext) {
+				Expect(k8sClient.Delete(ctx, cache)).To(Succeed(), "deleting environment test Cache")
+			})
+
+			Eventually(ctx, func(g Gomega) {
+				expectStatefulSetEnvVars(ctx, g, cacheName, cache.Spec.Env...)
+			}, timeout, pollInterval).Should(Succeed(), "waiting for added and overridden variables")
+
+			Eventually(ctx, func() error {
+				var current storagev1.Cache
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: cacheName, Namespace: resourceNamespace}, &current); err != nil {
+					return err
+				}
+				current.Spec.Env = []corev1.EnvVar{{Name: "STORAGE_LOG_LEVEL", Value: "DEBUG"}}
+				return k8sClient.Update(ctx, &current)
+			}, timeout, pollInterval).Should(Succeed(), "updating log level and removing the thread override")
+
+			Eventually(ctx, func(g Gomega) {
+				expectStatefulSetEnvVars(ctx, g, cacheName,
+					corev1.EnvVar{Name: "STORAGE_LOG_LEVEL", Value: "DEBUG"},
+					corev1.EnvVar{Name: "CACHESERVER_THREADPOOL_SIZE", Value: "16"},
+				)
+			}, timeout, pollInterval).Should(Succeed(), "waiting for updated values and restored defaults")
+
+			Eventually(ctx, func() error {
+				var current storagev1.Cache
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: cacheName, Namespace: resourceNamespace}, &current); err != nil {
+					return err
+				}
+				current.Spec.Env = nil
+				return k8sClient.Update(ctx, &current)
+			}, timeout, pollInterval).Should(Succeed(), "removing custom environment variables")
+
+			Eventually(ctx, func(g Gomega) {
+				expectStatefulSetEnvVars(ctx, g, cacheName,
+					corev1.EnvVar{Name: "CACHESERVER_THREADPOOL_SIZE", Value: "16"},
+				)
+				var statefulSet appsv1.StatefulSet
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cacheName, Namespace: resourceNamespace}, &statefulSet)).
+					To(Succeed(), "getting StatefulSet after removing overrides")
+				g.Expect(statefulSet.Spec.Template.Spec.Containers[0].Env).
+					NotTo(ContainElement(HaveField("Name", "STORAGE_LOG_LEVEL")), "removed custom variable should not be rendered")
+			}, timeout, pollInterval).Should(Succeed(), "waiting for custom variables to be removed")
+		})
+
+		DescribeTable("should support ConfigMap and Secret references",
+			func(ctx SpecContext, cacheName string, source *corev1.EnvVarSource) {
+				cache := createTestCache(cacheName, resourceNamespace, 1, true)
+				Expect(k8sClient.Create(ctx, cache)).To(Succeed(), "creating Cache for reference override")
+				DeferCleanup(func(ctx SpecContext) {
+					Expect(k8sClient.Delete(ctx, cache)).To(Succeed(), "deleting reference test Cache")
+				})
+
+				Eventually(ctx, func(g Gomega) {
+					expectStatefulSetEnvVars(ctx, g, cacheName,
+						corev1.EnvVar{Name: "CACHESERVER_THREADPOOL_SIZE", Value: "16"},
+					)
+				}, timeout, pollInterval).Should(Succeed(), "waiting for the default thread-pool value")
+
+				reference := corev1.EnvVar{Name: "CACHESERVER_THREADPOOL_SIZE", ValueFrom: source}
+				Eventually(ctx, func() error {
+					var current storagev1.Cache
+					if err := k8sClient.Get(ctx, types.NamespacedName{Name: cacheName, Namespace: resourceNamespace}, &current); err != nil {
+						return err
+					}
+					current.Spec.Env = []corev1.EnvVar{reference}
+					return k8sClient.Update(ctx, &current)
+				}, timeout, pollInterval).Should(Succeed(), "setting a reference override")
+
+				Eventually(ctx, func(g Gomega) {
+					expectStatefulSetEnvVars(ctx, g, cacheName, reference)
+				}, timeout, pollInterval).Should(Succeed(), "waiting for valueFrom without a literal value")
+
+				literal := corev1.EnvVar{Name: "CACHESERVER_THREADPOOL_SIZE", Value: "32"}
+				Eventually(ctx, func() error {
+					var current storagev1.Cache
+					if err := k8sClient.Get(ctx, types.NamespacedName{Name: cacheName, Namespace: resourceNamespace}, &current); err != nil {
+						return err
+					}
+					current.Spec.Env = []corev1.EnvVar{literal}
+					return k8sClient.Update(ctx, &current)
+				}, timeout, pollInterval).Should(Succeed(), "switching the override back to a literal")
+
+				Eventually(ctx, func(g Gomega) {
+					expectStatefulSetEnvVars(ctx, g, cacheName, literal)
+				}, timeout, pollInterval).Should(Succeed(), "waiting for a literal value without valueFrom")
+			},
+			Entry("using a ConfigMap key", "test-cache-env-configmap", &corev1.EnvVarSource{
+				ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "cache-settings"},
+					Key:                  "threads",
+				},
+			}),
+			Entry("using a Secret key", "test-cache-env-secret", &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "cache-settings"},
+					Key:                  "threads",
+				},
+			}),
+		)
 	})
 
 	Context("Multi-cache in same namespace", Ordered, func() {
